@@ -1,0 +1,760 @@
+---
+title: "Multidimensional Poverty Index (MPI) - Mozambique DHS 2022-23"
+subtitle: "Global MPI, Alkire-Foster method (OPHI/UNDP) By Edmilson Filimone"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float: true
+    code_folding: hide
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dpi = 120, out.width = "100%")
+```
+
+```{css, echo=FALSE}
+body { background: #f4f6f9; }
+.kpi-row { display: flex; flex-wrap: wrap; gap: 14px; margin: 16px 0; }
+.kpi { flex: 1 1 190px; background: #fff; border-radius: 10px; padding: 14px 16px;
+       box-shadow: 0 1px 6px rgba(0,0,0,.12); }
+.kpi-title { font-size: 11.5px; text-transform: uppercase; color: #666; letter-spacing: .05em; }
+.kpi-value { font-size: 32px; font-weight: 700; margin: 4px 0; line-height: 1.1; }
+.kpi-sub { font-size: 12px; color: #777; }
+.card { background: #fff; border-radius: 10px; padding: 14px 20px; margin: 16px 0;
+        box-shadow: 0 1px 6px rgba(0,0,0,.12); }
+.card h3, .card h4 { margin-top: 4px; }
+.note { background: #fff8e1; border-left: 4px solid #f5b800; padding: 10px 14px;
+        border-radius: 6px; font-size: 14px; }
+table { font-size: 13.5px; }
+```
+
+# What this script does
+
+It computes the global MPI (Alkire-Foster method, OPHI/UNDP) <https://10.1016/j.jpubeco.2010.11.006>. The steps are:
+
+1. Read the DHS files (PR = household members, BR = births)
+2. Build the person-level information
+3. Collapse to **household** level and create the 10 deprivation indicators (1 = deprived, 0 = not deprived)
+4. Compute each household's weighted deprivation score `c_i`
+5. Identify the poor (`c_i >= k`, with k = 1/3)
+6. Compute **H** (incidence), **A** (intensity) and **MPI = H x A**, with survey-design confidence intervals
+7. Decompose by indicator and disaggregate by province and urban/rural
+8. Run sensitive analysis and checks other k values
+
+
+# 1. Packages and data
+
+```{r packages}
+
+library(haven)     # read Stata files
+library(dplyr)     # data manipulation
+library(survey)    # complex survey estimates
+library(ggplot2)   # charts
+library(knitr)     # tables
+library(tidyr)     # reshaping for charts
+library(scales)    # chart labels
+
+```
+
+```{r settings}
+# ---- Files (edit if your names differ) ----
+pr_file <- "data/MZPR82FL.dta"   # Household Member Recode
+br_file <- "data/MZBR82FL.dta"   # Births Recode
+
+# ---- MPI parameters ----
+k <- 1/3                  # poverty cut-off (share of weighted deprivations)
+school_age <- c(6, 14)    # school-age range for the attendance indicator
+                          # (entry age 6 + 8 years of schooling; adjust if needed)
+
+# ---- Indicator weights (global MPI) ----
+weights <- c(
+  nutrition    = 1/6, child_mort  = 1/6,           # Health
+  years_school = 1/6, attendance  = 1/6,           # Education
+  cooking      = 1/18, sanitation = 1/18, water   = 1/18,   # Living standards
+  electricity  = 1/18, housing    = 1/18, assets  = 1/18
+)
+
+```
+
+
+# 2. Read the data
+
+## 2.1 Household member file (PR)
+
+```{r read-pr}
+
+# Variables
+pr_vars <- c(
+  # identifiers, design, weights
+  "hv001", "hv002", "hv005", "hv021", "hv022", "hv024", "hv025",
+  # member characteristics
+  "hv102", "hv105", "hv108", "hv121", "hv042",
+  # nutrition (children <5, women, men)
+  "hc70", "hc71", "ha40", "hb40",
+  # household characteristics
+  "hv201", "hv204", "hv205", "hv225", "hv206", "hv226",
+  "hv213", "hv214", "hv215","hv207", "hv208", "hv209", 
+  "hv210", "hv211", "hv212","hv221", "hv243a", "hv243c",
+  "hv243e"
+)
+
+# Read data
+pr <- read_dta(pr_file, col_select = any_of(pr_vars)) |>
+  mutate(province = as.character(as_factor(hv024)),
+         area     = as.character(as_factor(hv025))) |>
+  mutate(across(-c(province, area), ~ as.numeric(zap_labels(.x))))
+
+# If a variable is absent in this survey, create it as missing
+absent <- setdiff(pr_vars, names(pr))
+if (length(absent)) {
+  message("Variables not found in PR (set to missing): ", paste(absent, collapse = ", "))
+  for (v in absent) pr[[v]] <- NA_real_
+}
+
+# Keep usual household members (hv102 = 1, de jure) and build the household ID
+pr <- pr |>
+  filter(hv102 == 1) |>
+  mutate(hh = paste(hv001, hv002, sep = "_"))
+
+#cat("Persons:", nrow(pr), " | Households:", n_distinct(pr$hh))
+```
+
+## 2.2 Births file (BR) - for child mortality
+
+```{r read-br}
+br <- read_dta(br_file, col_select = any_of(c("v001", "v002", "v008", "b3", "b5", "b7"))) |>
+  mutate(across(everything(), ~ as.numeric(zap_labels(.x)))) |>
+  mutate(hh = paste(v001, v002, sep = "_"))
+
+# A child death counts if: child is dead (b5 = 0), died before age 18 (b7 < 216 months)
+# and died in the 60 months before the interview (date of death = birth CMC + age at death)
+hh_with_death <- br |>
+  filter(b5 == 0, b7 < 216, (b3 + b7) > (v008 - 60)) |>
+  distinct(hh) |>
+  pull(hh)
+
+#length(hh_with_death)   # nr of households with a child death in the last 5 years
+```
+
+# 3. Person-level variables
+
+```{r person-level}
+pr <- pr |>
+  mutate(
+    # ---- Nutrition (anthropometry values are stored x100; >= 9990 = flagged/missing)
+    haz   = ifelse(hc70 < 9990, hc70 / 100, NA),     # height-for-age z-score (child)
+    waz   = ifelse(hc71 < 9990, hc71 / 100, NA),     # weight-for-age z-score (child)
+    bmi_w = ifelse(ha40 < 9990, ha40 / 100, NA),     # women BMI
+    bmi_m = ifelse(hb40 < 9990, hb40 / 100, NA),     # men BMI
+    bmi   = coalesce(bmi_w, bmi_m),
+    z_min = suppressWarnings(pmin(haz, waz, na.rm = TRUE)),   # worst of HAZ/WAZ
+    z_min = ifelse(is.infinite(z_min), NA, z_min),
+
+    nut_measured = !is.na(z_min) | !is.na(bmi),
+    nut_dep      = (!is.na(z_min) & z_min < -2) | (!is.na(bmi) & bmi < 18.5),
+
+    # ---- Education
+    yrs = ifelse(hv108 %in% c(98, 99), NA, hv108)    # years of schooling
+  )
+
+# School Attendance 
+attend_code <- if (2 %in% pr$hv121) 2 else 1
+pr <- pr |> mutate(attending = ifelse(hv121 %in% c(0, attend_code), as.numeric(hv121 == attend_code), NA))
+```
+
+# 4. Household-level indicators
+
+## 4.1 Indicators built from household members (nutrition, schooling, attendance)
+
+```{r hh-persons}
+lo <- school_age[1]; hi <- school_age[2]
+
+hh_persons <- pr |>
+  group_by(hh) |>
+  summarise(
+    hhsize = n(),
+
+    # NUTRITION: deprived if ANY measured eligible member is undernourished.
+    # Anthropometry covers a sub-sample of households (hv042 = 1). Households outside
+    # the sub-sample are missing; selected households with no eligible person = not deprived.
+    nut_sel = ifelse(all(is.na(hv042)), any(nut_measured), first(hv042) == 1),
+    dep_nutrition = case_when(
+      !nut_sel                          ~ NA_real_,
+      any(nut_dep & nut_measured)       ~ 1,
+      TRUE                              ~ 0
+    ),
+
+    # YEARS OF SCHOOLING: deprived if NO member aged 10+ has 6+ years of schooling
+    dep_years_school = {
+      e <- hv105 >= 10
+      if (!any(e)) 0
+      else if (any(yrs[e] >= 6, na.rm = TRUE)) 0
+      else if (any(!is.na(yrs[e]))) 1
+      else NA_real_
+    },
+
+    # SCHOOL ATTENDANCE: deprived if ANY school-age child is not attending school
+    dep_attendance = {
+      e <- hv105 >= lo & hv105 <= hi
+      if (!any(e)) 0
+      else if (any(attending[e] == 0, na.rm = TRUE)) 1
+      else if (any(!is.na(attending[e]))) 0
+      else NA_real_
+    },
+    .groups = "drop"
+  )
+```
+
+## 4.2 Indicators built from household characteristics
+
+```{r hh-chars}
+hh_chars <- pr |>
+  group_by(hh) |>
+  slice(1) |>
+  ungroup() |>
+  mutate(
+    # COOKING FUEL: solid fuels (coal, charcoal, wood, straw, crop residue, dung) = deprived
+    dep_cooking = case_when(
+      hv226 %in% 6:11          ~ 1,
+      hv226 %in% c(1:5, 95)    ~ 0,     # 95 = no food cooked in household
+      TRUE                     ~ NA_real_
+    ),
+
+    # SANITATION: deprived if facility is unimproved OR shared
+    san_improved = hv205 %in% c(11:15, 21, 22, 41, 51),
+    san_known    = !is.na(hv205) & hv205 != 99,
+    dep_sanitation = case_when(
+      san_known & hv225 %in% 1           ~ 1,   # shared facility
+      san_known & !san_improved          ~ 1,
+      san_known & san_improved           ~ 0,
+      TRUE                               ~ NA_real_
+    ),
+
+    # DRINKING WATER: deprived if unimproved source OR round trip >= 30 minutes
+    wat_improved = hv201 %in% c(11:14, 21, 31, 41, 51, 61, 62, 71),
+    wat_known    = !is.na(hv201) & hv201 != 99,
+    wat_time     = ifelse(hv204 %in% c(998, 999), NA, ifelse(hv204 == 996, 0, hv204)),
+    dep_water = case_when(
+      wat_known & !wat_improved                    ~ 1,
+      wat_known & wat_improved & wat_time >= 30    ~ 1,
+      wat_known & wat_improved & !is.na(wat_time)  ~ 0,
+      TRUE                                         ~ NA_real_
+    ),
+
+    # ELECTRICITY
+    dep_electricity = case_when(hv206 == 0 ~ 1, hv206 == 1 ~ 0, TRUE ~ NA_real_),
+
+    # HOUSING: deprived if floor is natural, OR roof/wall are natural or rudimentary
+    floor_dep = case_when(hv213 %in% c(10, 11, 12) ~ 1, hv213 %in% c(13:95) ~ 0, TRUE ~ NA_real_),
+    roof_dep  = case_when(hv215 < 30 ~ 1, hv215 >= 30 & hv215 < 96 ~ 0, TRUE ~ NA_real_),
+    wall_dep  = case_when(hv214 < 30 ~ 1, hv214 >= 30 & hv214 < 96 ~ 0, TRUE ~ NA_real_),
+    dep_housing = case_when(
+      floor_dep %in% 1 | roof_dep %in% 1 | wall_dep %in% 1 ~ 1,
+      !is.na(floor_dep) & !is.na(roof_dep) & !is.na(wall_dep) ~ 0,
+      TRUE ~ NA_real_
+    ),
+    dummy = NA
+  ) |>
+  select(-dummy)
+
+# ASSETS: deprived if the household owns at most ONE of: radio, TV, telephone
+# (landline or mobile), computer, animal cart, bicycle, motorbike, refrigerator
+# AND owns no car/truck
+yn <- function(x) ifelse(x %in% c(0, 1), x, NA_real_)   # keep 0/1, others -> NA
+hh_chars <- hh_chars |>
+  mutate(
+    phone  = pmax(yn(hv221), yn(hv243a), na.rm = TRUE),
+    phone  = ifelse(is.infinite(phone), NA, phone),
+    n_small = rowSums(cbind(yn(hv207), yn(hv208), yn(hv209), yn(hv210),
+                            yn(hv211), phone, yn(hv243c), yn(hv243e)), na.rm = TRUE),
+    n_known = rowSums(!is.na(cbind(yn(hv207), yn(hv208), yn(hv209), yn(hv210),
+                                   yn(hv211), phone, yn(hv243c), yn(hv243e)))),
+    dep_assets = case_when(
+      yn(hv212) %in% 1 ~ 0,          # owns car/truck
+      n_small >= 2     ~ 0,
+      n_known == 0     ~ NA_real_,
+      TRUE             ~ 1
+    )
+  ) |>
+  select(hh, hv001, hv005, hv021, hv022, province, area,
+         starts_with("dep_"))
+```
+
+## 4.3 Child mortality and final household file
+
+```{r hh-final}
+hh <- hh_chars |>
+  left_join(hh_persons, by = "hh") |>
+  mutate(
+    # CHILD MORTALITY: deprived if any child died (<18 y) in the last 5 years.
+    # Households without such a death (or without women interviewed) = not deprived.
+    dep_child_mort = as.numeric(hh %in% hh_with_death),
+    hh_weight      = hv005 / 1e6,
+    person_weight  = hh_weight * hhsize       # so H = share of PEOPLE
+  )
+
+dep_cols <- paste0("dep_", names(weights))
+
+```
+
+## 4.4 Analysis sample
+
+The global MPI keeps only households with valid information in all 10 indicators
+(missing information by indicator is reported in section 9).
+
+```{r sample}
+mpi_data <- hh |> filter(if_all(all_of(dep_cols), ~ !is.na(.x)))
+cat("Households in total:", nrow(hh), "\n",
+    "Households with complete information (analysis sample):", nrow(mpi_data))
+```
+
+
+# 5. Deprivation score and poverty status
+
+```{r score}
+# c_i = sum of weights x deprivations
+dep_matrix <- as.matrix(mpi_data[, dep_cols])
+mpi_data$score <- as.vector(dep_matrix %*% weights[sub("dep_", "", dep_cols)])
+
+# Poor if c_i >= k  (small tolerance avoids floating-point problems at exactly 1/3)
+mpi_data$poor   <- as.numeric(mpi_data$score >= k - 1e-10)
+
+# Censored score: the score of non-poor households is set to 0
+mpi_data$c_cens <- mpi_data$score * mpi_data$poor
+
+# Censored indicators: deprived in indicator j AND multidimensionally poor
+for (v in dep_cols) mpi_data[[paste0("cens_", v)]] <- mpi_data[[v]] * mpi_data$poor
+
+# Survey design: PSU (hv021), strata (hv022), person weights
+options(survey.lonely.psu = "adjust")
+
+des <- svydesign(ids = ~hv021, strata = ~hv022, weights = ~person_weight,
+                 data = mpi_data, nest = TRUE)
+```
+
+# 6. Calculations for the report
+
+This chunk computes every number used in the cards and charts below.
+
+```{r results-calc}
+# ---- Headline measures --------------------------------------------------
+H   <- svymean(~poor,   des)
+MPI <- svymean(~c_cens, des)
+A   <- svyratio(~c_cens, ~poor, des)      # A = MPI / H
+
+H_pct  <- coef(H) * 100
+A_pct  <- coef(A) * 100
+MPI_v  <- coef(MPI)
+H_ci   <- confint(H) * 100
+A_ci   <- confint(A) * 100
+MPI_ci <- confint(MPI)
+
+# ---- Indicator names, dimensions and colours -------------------------------
+ind_names <- sub("dep_", "", dep_cols)
+dimension <- c(nutrition = "Health", child_mort = "Health",
+               years_school = "Education", attendance = "Education",
+               cooking = "Living standards", sanitation = "Living standards",
+               water = "Living standards", electricity = "Living standards",
+               housing = "Living standards", assets = "Living standards")
+dim_cols  <- c("Health" = "#e34a33", "Education" = "#2c7fb8", "Living standards" = "#31a354")
+pretty    <- c(nutrition = "Nutrition", child_mort = "Child mortality",
+               years_school = "Years of schooling", attendance = "School attendance",
+               cooking = "Cooking fuel", sanitation = "Sanitation", water = "Drinking water",
+               electricity = "Electricity", housing = "Housing", assets = "Assets")
+
+# ---- By indicator --------------------------------------------------------
+by_ind <- do.call(rbind, lapply(ind_names, function(j) {
+  unc <- coef(svymean(as.formula(paste0("~dep_", j)),      des))   # uncensored
+  cen <- coef(svymean(as.formula(paste0("~cens_dep_", j)), des))   # censored
+  data.frame(indicator = j, label = pretty[[j]], dimension = dimension[[j]],
+             weight = weights[[j]],
+             uncensored = unc * 100, censored = cen * 100,
+             contribution = 100 * weights[[j]] * cen / MPI_v)
+}))
+
+by_dim <- by_ind |> group_by(dimension) |>
+  summarise(contribution = sum(contribution), .groups = "drop")
+
+# ---- By province -----------------------------------------------------------
+prov <- svyby(~poor + c_cens, ~province, des, svymean, vartype = "ci") |>
+  transmute(province, H_pct = 100 * poor, H_low = 100 * ci_l.poor, H_upp = 100 * ci_u.poor,
+            A_pct = 100 * c_cens / poor,
+            MPI = c_cens, MPI_low = ci_l.c_cens, MPI_upp = ci_u.c_cens) |>
+  arrange(desc(MPI))
+
+cens_vars <- paste0("cens_dep_", ind_names)
+prov_dim <- svyby(as.formula(paste("~", paste(cens_vars, collapse = "+"))),
+                  ~province, des, svymean) |>
+  select(province, all_of(cens_vars)) |>
+  pivot_longer(-province, names_to = "indicator", values_to = "cens") |>
+  mutate(indicator = sub("cens_dep_", "", indicator),
+         dimension = dimension[indicator],
+         part      = cens * weights[indicator]) |>      # part of the province MPI
+  group_by(province, dimension) |>
+  summarise(part = sum(part), .groups = "drop")
+
+# ---- By area (urban / rural) ------------------------------------------------
+area <- svyby(~poor + c_cens, ~area, des, svymean, vartype = "ci") |>
+  transmute(area, H_pct = 100 * poor, A_pct = 100 * c_cens / poor,
+            MPI = c_cens, MPI_low = ci_l.c_cens, MPI_upp = ci_u.c_cens)
+
+# ---- Robustness to the poverty cut-off ---------------------------------------
+robust <- do.call(rbind, lapply(c(0.20, 1/3, 0.50), function(kk) {
+  mpi_data$p_k <- as.numeric(mpi_data$score >= kk - 1e-10)
+  mpi_data$c_k <- mpi_data$score * mpi_data$p_k
+  d  <- svydesign(ids = ~hv021, strata = ~hv022, weights = ~person_weight,
+                  data = mpi_data, nest = TRUE)
+  Hk <- coef(svymean(~p_k, d)); Mk <- coef(svymean(~c_k, d))
+  data.frame(k = paste0("k = ", round(kk * 100), "%"),
+             H = 100 * Hk, A = 100 * Mk / Hk, MPI = Mk)
+}))
+
+# Chart theme
+theme_mpi <- theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+```
+
+# 7. Results
+
+```{r cards, results='asis', echo=FALSE}
+kpi <- function(title, value, sub = "", color = "#2c7fb8") {
+  sprintf('<div class="kpi" style="border-top:5px solid %s"><div class="kpi-title">%s</div><div class="kpi-value" style="color:%s">%s</div><div class="kpi-sub">%s</div></div>',
+          color, title, color, value, sub)
+}
+ci_txt <- function(ci, d = 1) sprintf("95%% CI: %s - %s", formatC(ci[1], format = "f", digits = d),
+                                      formatC(ci[2], format = "f", digits = d))
+
+top_prov <- prov[1, ]
+low_prov <- prov[nrow(prov), ]
+rural <- area[grepl("rural", area$area, ignore.case = TRUE), ]
+urban <- area[grepl("urban", area$area, ignore.case = TRUE), ]
+
+cat('<div class="kpi-row">',
+    kpi("MPI", formatC(MPI_v, format = "f", digits = 3), ci_txt(MPI_ci, 3), "#1b4f72"),
+    kpi("Incidence", paste0(formatC(H_pct, format = "f", digits = 1), "%"),
+        paste("of people are MPI-poor.", ci_txt(H_ci)), "#e34a33"),
+    kpi("Intensity", paste0(formatC(A_pct, format = "f", digits = 1), "%"),
+        paste("avg. share of deprivations among the poor.", ci_txt(A_ci)), "#f39c12"),
+    kpi("Households analysed", comma(nrow(mpi_data)),
+        sprintf("%s%% of all households (complete information)", round(100 * nrow(mpi_data) / nrow(hh))),
+        "#31a354"),
+    '</div>')
+
+cat('<div class="kpi-row">',
+    kpi("Highest MPI", top_prov$province,
+        sprintf("MPI %.3f | H = %.1f%%", top_prov$MPI, top_prov$H_pct), "#c0392b"),
+    kpi("Lowest MPI", low_prov$province,
+        sprintf("MPI %.3f | H = %.1f%%", low_prov$MPI, low_prov$H_pct), "#27ae60"),
+    if (nrow(rural)) kpi("Rural MPI", formatC(rural$MPI, format = "f", digits = 3),
+                         sprintf("H = %.1f%%", rural$H_pct), "#8e6c3a") else "",
+    if (nrow(urban)) kpi("Urban MPI", formatC(urban$MPI, format = "f", digits = 3),
+                         sprintf("H = %.1f%%", urban$H_pct), "#2980b9") else "",
+    '</div>')
+```
+
+::: {.note}
+**How to read this.** A household is *MPI-poor* when its weighted deprivation score is at least
+`r round(k * 100, 1)`% (k = 1/3). **H** is the share of people who are poor, **A** is how many
+deprivations the poor face on average, and **MPI = H x A**. Estimates are person-weighted and
+account for the survey design (PSU, strata).
+:::
+
+## 7.1 What drives poverty? Contribution by indicator
+
+::: {.card}
+```{r plot-contribution, fig.height=4.8}
+ggplot(by_ind, aes(x = reorder(label, contribution), y = contribution, fill = dimension)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.1f%%", contribution)), hjust = -0.1, size = 3.6) +
+  scale_fill_manual(values = dim_cols, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  coord_flip() +
+  labs(x = NULL, y = "% contribution to the MPI",
+       title = "Contribution of each indicator to the MPI") +
+  theme_mpi
+```
+:::
+
+::: {.card}
+```{r plot-dimension, fig.height=2.6}
+ggplot(by_dim, aes(x = 1, y = contribution, fill = dimension)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = sprintf("%s\n%.1f%%", dimension, contribution)),
+            position = position_stack(vjust = 0.5), colour = "white", size = 3.8, fontface = "bold") +
+  scale_fill_manual(values = dim_cols, guide = "none") +
+  coord_flip() +
+  labs(x = NULL, y = NULL, title = "Contribution by dimension") +
+  theme_mpi + theme(axis.text = element_blank(), panel.grid = element_blank())
+```
+:::
+
+## 7.2 Who is deprived? Uncensored vs censored headcount
+
+Uncensored = share of people deprived in the indicator. Censored = share of people who are
+deprived in the indicator **and** MPI-poor.
+
+::: {.card}
+```{r plot-headcounts, fig.height=5}
+by_ind |>
+  select(label, dimension, Uncensored = uncensored, Censored = censored) |>
+  pivot_longer(c(Uncensored, Censored), names_to = "type", values_to = "pct") |>
+  mutate(type = factor(type, levels = c("Uncensored", "Censored"))) |>
+  ggplot(aes(x = reorder(label, pct), y = pct, fill = type)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_fill_manual(values = c(Uncensored = "#9ecae1", Censored = "#08519c"), name = NULL) +
+  coord_flip() +
+  labs(x = NULL, y = "% of people", title = "Headcount ratios by indicator") +
+  theme_mpi
+```
+:::
+
+```{r table-indicators}
+by_ind |>
+  transmute(Indicator = label, Dimension = dimension, Weight = round(weight, 3),
+            `Uncensored (%)` = uncensored, `Censored (%)` = censored,
+            `Contribution (%)` = contribution) |>
+  flextable::as_flextable()|> 
+  flextable::theme_vanilla()|>
+  flextable::delete_rows(i = 2, part = "header")|>
+  flextable::add_header_row(values = c("","Indicator-level results", ""), colwidths = c(2,3,1))
+```
+
+## 7.3 Distribution of the deprivation score
+
+::: {.card}
+```{r plot-score, fig.height=3.8}
+ggplot(mpi_data, aes(x = score, weight = person_weight,
+                     y = after_stat(count / sum(count) * 100))) +
+  geom_histogram(binwidth = 0.05, boundary = 0, fill = "#2c7fb8", colour = "white") +
+  geom_vline(xintercept = k, colour = "#c0392b", linetype = "dashed", linewidth = 0.9) +
+  annotate("text", x = k + 0.01, y = Inf, vjust = 1.6, hjust = 0, colour = "#c0392b",
+           label = paste0("Poverty cut-off k = ", round(k * 100, 1), "%")) +
+  labs(x = "Weighted deprivation score (c)", y = "% of people",
+       title = "Who is poor? Distribution of the deprivation score") +
+  theme_mpi
+```
+:::
+
+## 7.4 By province
+
+::: {.card}
+```{r plot-province-mpi, fig.height=5.2}
+ggplot(prov, aes(x = reorder(province, MPI), y = MPI)) +
+  geom_col(fill = "#2c7fb8", width = 0.7) +
+  geom_errorbar(aes(ymin = MPI_low, ymax = MPI_upp), width = 0.3) +
+  geom_text(aes(y = MPI_upp, label = sprintf("%.3f", MPI)), hjust = -0.2, size = 3.5) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  coord_flip() +
+  labs(x = NULL, y = "MPI (95% CI)", title = "MPI by province") +
+  theme_mpi
+```
+:::
+
+:::{.card}
+```{r include=FALSE}
+# Load shape-file data
+bas_path <- "D:/INS-BD/Plano Executivo/Data_Analysis/Bring-Data/Mapa"
+province <- sf::st_read(paste0(bas_path,"/Shapes/moz/moz_admbnda_adm1_ine_20190607.shp"))
+centroid <- sf::st_read(paste0(bas_path, "./Shapes/provinces_centroids.shp"))
+shadow <- sf::st_read(paste0(bas_path, "./Shapes/moz/moz_admbnda_adm2_ine_20190607.shp")) # only for style
+
+# lowercase textual columns
+province <- province |> mutate(across(where(is.character), tolower))
+centroid <- centroid |> mutate(across(where(is.character), tolower))
+
+# Filter data - selecting MPI for province
+# Changes the name of the province column in the table with MPI data...
+# To match with the column name (ADM1_PT) in the shape-file
+# Standardizing the provinces names to match with shape-file
+prov_ <- prov |> as_tibble() |>
+  rename(ADM1_PT = province) |>
+  mutate(ADM1_PT = case_when(
+    ADM1_PT == "cidade de maputo" ~ "maputo city",
+    ADM1_PT == "zambézia" ~ "zambezia",
+    TRUE ~ ADM1_PT #else
+  ))
+
+# Join data (shape + data)
+layer_province <- full_join(province, prov_, by = "ADM1_PT")
+layer_centroids <- full_join(centroid, prov_, by = "ADM1_PT")
+
+# Costume labels
+layer_province <- layer_province |>
+  mutate(mpi_cat = case_when(
+    MPI < 0.1 ~ "<10",
+    MPI >= 0.1 & MPI <= 0.2 ~ "10 to 20",
+    MPI > 0.2 & MPI < 0.33 ~ "20 to 32",
+    MPI >= 0.33 ~ ">=33"
+  ))
+
+layer_province$mpi_cat <- factor(layer_province$mpi_cat, 
+                                             levels=c("<10", "10 to 20", "20 to 32", ">=33"))
+layer_province$ADM1_PT <- stringr::str_to_title(layer_province$ADM1_PT)
+
+layer_centroids$label <- paste0(round(layer_centroids$MPI*100), "%") # displays x.x% on the label
+
+```
+
+```{r fig.dpi=720, fig.align='center', fig.width=8, fig.height=8}
+# Map
+
+# Palette
+red_palette <- c("#FFF7F3", "#FC8D73", "#F57B8A", "#DC4D4D")
+
+ggplot() +
+    # Layers
+    geom_sf(data = shadow, color="#636363")+
+    # Boundaries
+    geom_sf(data=layer_province, 
+            aes(fill = mpi_cat),
+            alpha=0.93)+
+    scale_fill_manual(values = red_palette,
+                      guide=guide_legend(position="left",
+                                         title = "MPI (%)",
+                                         theme = theme(
+                                           legend.title = element_text(size = 10, lineheight = 5),
+                                           legend.margin = margin(200,0,0,5),
+                                           legend.key.height = unit(12,"pt"),
+                                           legend.key.width =  unit(12,"pt"),
+                                           legend.key.spacing.y = unit(x = 5, units = "pt"))))+
+    # Bubbles
+    geom_sf(data=layer_centroids, 
+            aes(size=MPI),
+            colour="skyblue",
+            alpha=0.5, 
+            show.legend = FALSE)+
+    scale_size_continuous(range = c(8, 16)) +
+    # Labels para bubbles
+    geom_sf_text(data = layer_centroids, 
+                 aes(label=label), 
+                 size=4,
+                 fontface="bold",
+                 ) +
+    # label para provinces
+    geom_sf_text(data = filter(layer_province, 
+                               ADM1_PT != "Maputo City" & ADM1_PT != "Zambezia"), 
+                 aes(label= ADM1_PT), 
+                 size=3, 
+                 nudge_y =.8)+
+      # Labels para Maputo e Zambezia (ajustes de posicao)
+    geom_sf_text(data = filter(layer_province, ADM1_PT == "Maputo City"), 
+                 aes(label= ADM1_PT), 
+                 size=3, 
+                 nudge_y =.2, 
+                 nudge_x = 1.1)+ 
+    geom_sf_text(data = filter(layer_province, ADM1_PT == "Zambezia"), 
+                 aes(label= ADM1_PT), 
+                 size=3, 
+                 nudge_y =.8, 
+                 nudge_x = 0.9)+
+    theme_void(base_size = 11, 
+               base_family = "Roboto")
+
+
+```
+:::
+
+::: {.card}
+```{r plot-province-dim, fig.height=5.2}
+prov_dim |>
+  mutate(province = factor(province, levels = prov$province[order(prov$MPI)])) |>
+  ggplot(aes(x = province, y = part, fill = dimension)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = dim_cols, name = NULL) +
+  coord_flip() +
+  labs(x = NULL, y = "MPI (stacked by dimension)",
+       title = "What drives the MPI in each province?") +
+  theme_mpi
+```
+:::
+
+```{r table-province}
+prov |>
+  transmute(Province = province,
+            `H (%)` = H_pct,
+            `A (%)` = A_pct,
+            `MPI (95% CI)` = paste0(round(100*MPI,1)," (",round(100*MPI_low,1),"-",round(100*MPI_upp,1),")")) |>
+  flextable::as_flextable(max_row = 11)|> 
+  flextable::theme_vanilla()|>
+  flextable::delete_rows(i = 2, part = "header")
+```
+
+## 7.5 Urban vs rural
+
+::: {.card}
+```{r plot-area, fig.height=3.2}
+area |>
+  pivot_longer(c(H_pct, A_pct), names_to = "measure", values_to = "value") |>
+  mutate(measure = recode(measure, H_pct = "H - incidence (%)", A_pct = "A - intensity (%)")) |>
+  ggplot(aes(x = area, y = value, fill = area)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.1f", value)), vjust = -0.4) +
+  facet_wrap(~measure, scales = "free_y") +
+  scale_fill_manual(values = c("#8e6c3a", "#2980b9", "#7f8c8d")[seq_len(nrow(area))]) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = NULL, title = "Incidence and intensity by area") +
+  theme_mpi
+```
+:::
+
+# 8. Sensitive Analysis: other poverty cut-offs
+
+::: {.card}
+```{r plot-robust, fig.height=3.6}
+robust |>
+  pivot_longer(c(H, A, MPI), names_to = "measure", values_to = "value") |>
+  mutate(measure = recode(measure, H = "H (%)", A = "A (%)", MPI = "MPI")) |>
+  ggplot(aes(x = k, y = value, fill = k)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = ifelse(measure == "MPI", sprintf("%.3f", value), sprintf("%.1f", value))),
+            vjust = -0.4, size = 3.5) +
+  facet_wrap(~measure, scales = "free_y") +
+  scale_fill_manual(values = c("#9ecae1", "#2c7fb8", "#08306b")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = NULL, title = "Sensitivity to the poverty cut-off (k = 50% is 'severe' poverty)") +
+  theme_mpi
+```
+:::
+
+# 9. Data quality: missing information
+
+The global MPI keeps only households with valid information in all 10 indicators.
+
+```{r missing}
+miss <- sapply(hh[dep_cols], function(x) round(100 * mean(is.na(x)), 1))
+data.frame(Indicator = pretty[sub("dep_", "", names(miss))], `% households missing` = miss,
+           check.names = FALSE, row.names = NULL) |>
+ flextable::flextable(cwidth = 2)
+```
+
+```{r plot-missing, fig.height=3.8}
+data.frame(label = pretty[sub("dep_", "", names(miss))], pct = miss) |>
+  ggplot(aes(x = reorder(label, pct), y = pct)) +
+  geom_col(fill = "#e67e22", width = 0.7) +
+  coord_flip() +
+  labs(x = NULL, y = "% of households with missing information",
+       title = "Missing information by indicator") +
+  theme_mpi
+```
+
+# 10. Notes
+
+* **Compare with the official global MPI for Mozambique** (OPHI/UNDP).
+  Small differences are expected because of the simplifications below.
+* Nutrition is measured in a subsample of households, so the analysis sample is mostly that subsample
+  (as in the global MPI).
+* Bottled water is treated as an improved source (OPHI also checks the source used for other purposes).
+* BMI < 18.5 is applied to everyone aged 15+; OPHI uses BMI-for-age for adolescents aged 15-19.
+* Child mortality uses the birth histories of interviewed women; households without an
+  interviewed woman are treated as not deprived.
+* "Other" categories (code 96) in housing materials are treated as missing.
+
+```{r session}
+sessionInfo()
+```
